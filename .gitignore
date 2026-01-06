@@ -49,3 +49,7 @@ cloudflared-config.yml
 chromedriver.exe
 chromedriver
 .wdm/
+
+# 只保留 README.md
+*.md
+!README.md
