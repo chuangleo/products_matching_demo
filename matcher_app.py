@@ -399,8 +399,15 @@ def load_local_data():
     except Exception as e:
         return pd.DataFrame(), pd.DataFrame()
 
-def calculate_similarities_in_memory(momo_df, pchome_df, model):
-    """在內存中計算相似度（不寫入文件）"""
+def calculate_similarities_in_memory(momo_df, pchome_df, model, direction="momo_to_pchome"):
+    """在內存中計算相似度（不寫入文件）
+    
+    Args:
+        momo_df: MOMO 商品資料
+        pchome_df: PChome 商品資料
+        model: 語意模型
+        direction: 比對方向，"momo_to_pchome" 或 "pchome_to_momo"
+    """
     if momo_df.empty or pchome_df.empty:
         return {}
     
@@ -417,32 +424,62 @@ def calculate_similarities_in_memory(momo_df, pchome_df, model):
         similarities = {}
         threshold = 0.739465
         
-        for idx, momo_row in momo_df.iterrows():
-            momo_id = str(momo_row['id'])
-            momo_emb = momo_embeddings[idx].unsqueeze(0)
-            
-            # 計算與所有 PChome 商品的相似度
-            cos_similarities = torch.nn.functional.cosine_similarity(
-                momo_emb, pchome_embeddings, dim=1
-            ).numpy()
-            
-            # 找出超過門檻的商品
-            matches = []
-            for pchome_idx, score in enumerate(cos_similarities):
-                if score >= threshold:
-                    pchome_row = pchome_df.iloc[pchome_idx]
-                    matches.append({
-                        'pchome_id': str(pchome_row['id']),
-                        'pchome_title': pchome_row['title'],
-                        'pchome_price': pchome_row.get('price'),
-                        'pchome_image': pchome_row.get('image', ''),
-                        'pchome_url': pchome_row.get('url', ''),
-                        'similarity': float(score)
-                    })
-            
-            # 按相似度排序
-            matches.sort(key=lambda x: x['similarity'], reverse=True)
-            similarities[momo_id] = matches
+        if direction == "momo_to_pchome":
+            # MOMO → PChome（預設）
+            for idx, momo_row in momo_df.iterrows():
+                momo_id = str(momo_row['id'])
+                momo_emb = momo_embeddings[idx].unsqueeze(0)
+                
+                # 計算與所有 PChome 商品的相似度
+                cos_similarities = torch.nn.functional.cosine_similarity(
+                    momo_emb, pchome_embeddings, dim=1
+                ).numpy()
+                
+                # 找出超過門檻的商品
+                matches = []
+                for pchome_idx, score in enumerate(cos_similarities):
+                    if score >= threshold:
+                        pchome_row = pchome_df.iloc[pchome_idx]
+                        matches.append({
+                            'target_id': str(pchome_row['id']),
+                            'target_title': pchome_row['title'],
+                            'target_price': pchome_row.get('price'),
+                            'target_image': pchome_row.get('image', ''),
+                            'target_url': pchome_row.get('url', ''),
+                            'similarity': float(score)
+                        })
+                
+                # 按相似度排序
+                matches.sort(key=lambda x: x['similarity'], reverse=True)
+                similarities[momo_id] = matches
+        else:
+            # PChome → MOMO
+            for idx, pchome_row in pchome_df.iterrows():
+                pchome_id = str(pchome_row['id'])
+                pchome_emb = pchome_embeddings[idx].unsqueeze(0)
+                
+                # 計算與所有 MOMO 商品的相似度
+                cos_similarities = torch.nn.functional.cosine_similarity(
+                    pchome_emb, momo_embeddings, dim=1
+                ).numpy()
+                
+                # 找出超過門檻的商品
+                matches = []
+                for momo_idx, score in enumerate(cos_similarities):
+                    if score >= threshold:
+                        momo_row = momo_df.iloc[momo_idx]
+                        matches.append({
+                            'target_id': str(momo_row['id']),
+                            'target_title': momo_row['title'],
+                            'target_price': momo_row.get('price'),
+                            'target_image': momo_row.get('image', ''),
+                            'target_url': momo_row.get('url', ''),
+                            'similarity': float(score)
+                        })
+                
+                # 按相似度排序
+                matches.sort(key=lambda x: x['similarity'], reverse=True)
+                similarities[pchome_id] = matches
         
         return similarities
     except Exception as e:
@@ -512,11 +549,12 @@ def gemini_verify_match(momo_title, pchome_title, similarity_score, momo_price=0
     except Exception as e:
         return {"is_match": False, "confidence": "low", "reasoning": f"API 錯誤: {str(e)}"}
 
-def gemini_verify_batch(match_pairs):
-    """批次驗證商品配對（一次處理一個 MOMO 商品的所有候選商品）
+def gemini_verify_batch(match_pairs, direction="momo_to_pchome"):
+    """批次驗證商品配對（一次處理一個來源商品的所有候選商品）
     
     Args:
-        match_pairs: list of dict, 每個 dict 包含 {'momo_title', 'pchome_title', 'similarity'}
+        match_pairs: list of dict, 每個 dict 包含 {'momo_title', 'pchome_title', 'momo_price', 'pchome_price', 'similarity'}
+        direction: 比對方向，"momo_to_pchome" 或 "pchome_to_momo"
     
     Returns:
         list of dict: 每個結果包含 {'is_match', 'confidence', 'reasoning'}
@@ -524,11 +562,19 @@ def gemini_verify_batch(match_pairs):
     if not match_pairs:
         return []
     
+    # 根據比對方向設定平台名稱
+    if direction == "momo_to_pchome":
+        platform_a = "MOMO"
+        platform_b = "PChome"
+    else:
+        platform_a = "PChome"
+        platform_b = "MOMO"
+    
     # 構建批次 prompt
-    prompt = """你是一個電商產品匹配專家。以下是「一個 MOMO 商品」與「多個 PChome 候選商品」的比對任務。
+    prompt = f"""你是一個電商產品匹配專家。以下是「一個 {platform_a} 商品」與「多個 {platform_b} 候選商品」的比對任務。
 
 **重要提示**：
-- 這些 PChome 商品都是同一個 MOMO 商品的潛在匹配候選
+- 這些 {platform_b} 商品都是同一個 {platform_a} 商品的潛在匹配候選
 - **請獨立判斷每一個配對，不要受其他配對結果影響**
 - **即使其中某個商品已經匹配，其他商品仍可能同樣匹配**（不同賣家販售相同商品是正常的）
 - **即使所有商品都不匹配也完全正常**（請不要因為候選數量多就強行找出匹配）
@@ -540,7 +586,7 @@ def gemini_verify_batch(match_pairs):
 **核心匹配規則**：
 1. **品牌與型號**：必須完全一致（注意：不同語言的品牌名稱，如 "Logitech" 和 "羅技" 是同一品牌）。
 2. **規格變體**：主要規格（如容量 128G vs 256G）不同視為「不同商品」。
-3. **顏色差異**：**相同產品的不同顏色，一律視為「相同商品」**（例如：黑色 iPhone 和白色 iPhone 視為同一商品）。**判斷理由中請明確說明顏色差異**，格式如：「相同商品(顏色不同)。MOMO: 黑色 vs PChome: 白色」。如果有顏色代碼，也請列出。
+3. **顏色差異**：**相同產品的不同顏色，一律視為「相同商品」**（例如：黑色 iPhone 和白色 iPhone 視為同一商品）。**判斷理由中請明確說明顏色差異**，格式如：「相同商品(顏色不同)。{platform_a}: 黑色 vs {platform_b}: 白色」。如果有顏色代碼，也請列出。
 4. **包裝數量差異**：**相同產品的不同包裝數量，一律視為「相同商品」**（例如：60包衛生紙 vs 10包衛生紙視為同一商品，請在理由中提供單件價格比較）。
 5. **口味差異**：**相同產品的不同口味，一律視為「相同商品」**。特別注意：如果一個商品標示多種口味選項（如「香辣+鹽焗」），另一個商品只標示其中一種口味（如「鹽焗」），視為相同商品的不同口味選項。
 6. **福利品 vs 全新品**：**相同產品的福利品與全新品，一律視為「相同商品」**。福利品通常標示為「福利品」「展示品」「整新品」「二手」等。**判斷理由中必須特別註記福利品資訊**。
@@ -552,14 +598,14 @@ def gemini_verify_batch(match_pairs):
 
 **判斷理由格式要求（針對包裝數量不同的情況）**：
 - 如果是相同商品但包裝數量不同，請計算並顯示單件價格
-- 格式範例：「相同商品(包裝量不同)。單價：MOMO $19.98/包 vs PChome $23.90/包」
+- 格式範例：「相同商品(包裝量不同)。單價：{platform_a} $19.98/包 vs {platform_b} $23.90/包」
 - **如果是相同商品但顏色不同，請明確說明顏色差異**
-- 格式範例：「相同商品(顏色不同)。MOMO: 米白(FD4328-100) vs PChome: 米白酒紅(FD4328-107)」
+- 格式範例：「相同商品(顏色不同)。{platform_a}: 米白(FD4328-100) vs {platform_b}: 米白酒紅(FD4328-107)」
 - **如果其中一個商品是福利品，必須特別註記**
-- 格式範例：「相同商品(福利品)。MOMO: 全新 vs PChome: 福利品」或「相同商品(福利品)。注意PChome為展示品」
+- 格式範例：「相同商品(福利品)。{platform_a}: 全新 vs {platform_b}: 福利品」或「相同商品(福利品)。注意{platform_b}為展示品」
 - 從商品標題提取數量資訊（如「60包」「10包」「90抽x10包」「3串」），用總價除以數量計算單價
 - 如果標題中有多個數字（如「90抽x60包」），優先使用「包」「入」「盒」「組」「串」等單位的數量
-- **重要：單價比較時必須明確使用「MOMO」和「PChome」作為平台名稱，不可使用 A/B 或商品A/商品B 等代號**
+- **重要：單價比較時必須明確使用「{platform_a}」和「{platform_b}」作為平台名稱，不可使用 A/B 或商品A/商品B 等代號**
 
 ---
 
@@ -570,9 +616,9 @@ def gemini_verify_batch(match_pairs):
         momo_price = pair.get('momo_price', 0)
         pchome_price = pair.get('pchome_price', 0)
         prompt += f"""【配對 {i}】
-商品 A (Momo)：{pair['momo_title']}
+商品 A ({platform_a})：{pair['momo_title']}
 商品 A 價格：NT$ {momo_price:,.0f}
-商品 B (PChome)：{pair['pchome_title']}
+商品 B ({platform_b})：{pair['pchome_title']}
 商品 B 價格：NT$ {pchome_price:,.0f}
 第一階段相似度：{pair['similarity']:.4f}
 
@@ -580,8 +626,8 @@ def gemini_verify_batch(match_pairs):
     
     prompt += f"""請針對以上 {len(match_pairs)} 組商品配對，分別判斷並回傳純 JSON 陣列格式：
 [
-    {{"is_match": true/false, "confidence": "high/medium/low", "reasoning": "繁體中文理由(50字內，包裝量不同時用'MOMO'和'PChome'標示單價)"}},
-    {{"is_match": true/false, "confidence": "high/medium/low", "reasoning": "繁體中文理由(50字內，包裝量不同時用'MOMO'和'PChome'標示單價)"}},
+    {{"is_match": true/false, "confidence": "high/medium/low", "reasoning": "繁體中文理由(50字內，包裝量不同時用'{platform_a}'和'{platform_b}'標示單價)"}},
+    {{"is_match": true/false, "confidence": "high/medium/low", "reasoning": "繁體中文理由(50字內，包裝量不同時用'{platform_a}'和'{platform_b}'標示單價)"}},
     ...
 ]
 
@@ -798,11 +844,12 @@ def handle_product_search(keyword, model, momo_progress_placeholder, momo_status
         
         try:
             calc_progress.progress(30, text="找尋相似產品中...")
-            # 在內存中計算相似度
+            # 在內存中計算相似度，傳入比對方向
             st.session_state.similarities = calculate_similarities_in_memory(
                 st.session_state.momo_df,
                 st.session_state.pchome_df,
-                model
+                model,
+                direction=st.session_state.get('match_direction', 'momo_to_pchome')
             )
             
             calc_progress.progress(100, text="完成！")
@@ -848,11 +895,22 @@ with col_header_left:
 with col_header_right:
     # 搜尋欄在右上角
     with st.form("search_form", clear_on_submit=False):
+        # 比對方向選擇
+        match_direction = st.radio(
+            "比對方向",
+            options=["momo_to_pchome", "pchome_to_momo"],
+            format_func=lambda x: "📦 MOMO → PChome" if x == "momo_to_pchome" else "📦 PChome → MOMO",
+            horizontal=True,
+            label_visibility="collapsed"
+        )
         search_keyword = st.text_input("商品名稱", placeholder="例如：dyson 吸塵器", label_visibility="collapsed")
         search_button = st.form_submit_button("🔍 搜尋", use_container_width=True, type="primary")
 
 # 處理搜尋（在主畫面中間顯示進度）
 if search_button and search_keyword:
+    # 儲存比對方向到 session state
+    st.session_state.match_direction = match_direction
+    
     # 創建置中的進度顯示區域
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -935,8 +993,8 @@ pchome_candidates_pool = pchome_df.reset_index(drop=True)
 threshold = 0.739465
 
 # 初始化選中的商品索引
-if 'selected_momo_index' not in st.session_state:
-    st.session_state.selected_momo_index = None
+if 'selected_product_index' not in st.session_state:
+    st.session_state.selected_product_index = None
 if 'dialog_open' not in st.session_state:
     st.session_state.dialog_open = False
 if 'dialog_key' not in st.session_state:
@@ -944,7 +1002,7 @@ if 'dialog_key' not in st.session_state:
 
 # ============= 比對結果 Dialog 函數 =============
 @st.dialog("🔍 商品比價結果", width="large")
-def show_comparison_dialog(selected_momo_row, dialog_key):
+def show_comparison_dialog(selected_product_row, dialog_key):
     """顯示商品比對結果"""
     
     # 第一步：完全清空對話框內容
@@ -953,7 +1011,7 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
         st.markdown("")
     
     # 使用商品ID和dialog_key組合作為唯一標識
-    unique_key = f"{selected_momo_row.get('id', 0)}_{dialog_key}_{int(time.time() * 1000)}"
+    unique_key = f"{selected_product_row.get('id', 0)}_{dialog_key}_{int(time.time() * 1000)}"
     
     # 清空佔位符
     clear_placeholder.empty()
@@ -965,12 +1023,21 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
         # 使用兩欄布局顯示比對結果
         col_main_left, col_main_right = st.columns([1, 2], gap="large")
         
-        # --- 左側：顯示選中的 MOMO 商品 ---
+        # --- 左側：顯示選中的商品 ---
         with col_main_left:
             st.markdown("### 🎯 選中的商品")
             
+            # 根據比對方向決定顯示的平台標籤
+            match_direction = st.session_state.get('match_direction', 'momo_to_pchome')
+            if match_direction == 'momo_to_pchome':
+                platform_badge = "MOMO 購物網"
+                badge_class = "badge-momo"
+            else:
+                platform_badge = "PChome 購物網"
+                badge_class = "badge-pchome"
+            
             # 顯示選中商品的詳細卡片
-            price = selected_momo_row.get('price')
+            price = selected_product_row.get('price')
             if pd.isna(price) or price is None:
                 price_str = "價格未提供"
             else:
@@ -978,20 +1045,20 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
             
             st.markdown(f"""
             <div class="product-card">
-                <div class="badge badge-momo">MOMO 購物網</div>
+                <div class="badge {badge_class}">{platform_badge}</div>
                 <div class="img-container">
-                    <img src="{selected_momo_row.get('image', '')}" 
-                         alt="{selected_momo_row['title'][:50]}" 
+                    <img src="{selected_product_row.get('image', '')}" 
+                         alt="{selected_product_row['title'][:50]}" 
                          loading="lazy"
                          onerror="this.onerror=null; this.src='https://via.placeholder.com/200x200?text=無法載入圖片';">
                 </div>
-                <h4 style="margin-top:15px; line-height:1.4;">{selected_momo_row['title']}</h4>
+                <h4 style="margin-top:15px; line-height:1.4;">{selected_product_row['title']}</h4>
                 <div class="price-tag"><span class="price-symbol">NT$</span> {price_str}</div>
                 <div style="color:#718096; font-size:0.9rem; margin-top:10px;">
-                    <strong>ID:</strong> {selected_momo_row.get('id', 'N/A')}<br>
-                    <strong>SKU:</strong> {selected_momo_row.get('sku', 'N/A')}
+                    <strong>ID:</strong> {selected_product_row.get('id', 'N/A')}<br>
+                    <strong>SKU:</strong> {selected_product_row.get('sku', 'N/A')}
                 </div>
-                <a href="{selected_momo_row.get('url', '#')}" target="_blank" 
+                <a href="{selected_product_row.get('url', '#')}" target="_blank" 
                    style="display:block; text-align:center; margin-top:20px; background:#f7f9fc; color:#4a5568; padding:8px; border-radius:8px; text-decoration:none; font-weight:bold; font-size:0.9rem;">
                    開啟商品頁面 ↗
                 </a>
@@ -1004,8 +1071,12 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
         
         # --- 右側：Action & Results ---
         with col_main_right:
+            # 根據比對方向顯示不同的標題
+            match_direction = st.session_state.get('match_direction', 'momo_to_pchome')
+            target_platform = "PChome" if match_direction == 'momo_to_pchome' else "MOMO"
+            
             # 建立固定的標題
-            st.markdown("### ⚡ 在 PChome 尋找相同商品")
+            st.markdown(f"### ⚡ 在 {target_platform} 尋找相同商品")
             progress_container = st.empty()
             
             # 清空區域標記
@@ -1016,18 +1087,18 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
             # 自動開始比對（當選擇新商品時）
             if is_valid_selection and is_new_selection:
                 
-                momo_id = str(selected_momo_row['id'])
+                product_id = str(selected_product_row['id'])
                 
                 # 直接使用預計算的相似度資料
                 stage1_matches_list = []
                 
-                if st.session_state.similarities and momo_id in st.session_state.similarities:
-                    stage1_matches_list = st.session_state.similarities[momo_id]
+                if st.session_state.similarities and product_id in st.session_state.similarities:
+                    stage1_matches_list = st.session_state.similarities[product_id]
                 
                 # 檢查第一階段結果，如果沒有找到則立即顯示
                 if not stage1_matches_list:
-                    st.warning("⚠️ 在 PChome 沒有找到相似的商品")
-                    st.info("💡 建議：\n- 選擇其他商品再試一次\n- 或直接到 PChome 網站手動搜尋")
+                    st.warning(f"⚠️ 在 {target_platform} 沒有找到相似的商品")
+                    st.info(f"💡 建議：\n- 選擇其他商品再試一次\n- 或直接到 {target_platform} 網站手動搜尋")
                 else:
                     candidates_to_verify = stage1_matches_list
                     
@@ -1047,10 +1118,10 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
                     # 準備所有配對資料（包含價格資訊）
                     all_pairs = [
                         {
-                            'momo_title': selected_momo_row['title'],
-                            'momo_price': float(selected_momo_row.get('price', 0)),
-                            'pchome_title': match['pchome_title'],
-                            'pchome_price': float(match.get('pchome_price', 0)),
+                            'momo_title': selected_product_row['title'],
+                            'momo_price': float(selected_product_row.get('price', 0)),
+                            'pchome_title': match['target_title'],
+                            'pchome_price': float(match.get('target_price', 0)),
                             'similarity': match['similarity']
                         }
                         for match in candidates_to_verify
@@ -1059,8 +1130,8 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
                     # 記錄開始時間
                     stage2_start_time = time.time()
                     
-                    # 單次 API 呼叫處理所有配對
-                    all_results = gemini_verify_batch(all_pairs)
+                    # 單次 API 呼叫處理所有配對，傳入比對方向
+                    all_results = gemini_verify_batch(all_pairs, direction=match_direction)
                     
                     # 記錄結束時間
                     stage2_end_time = time.time()
@@ -1080,8 +1151,8 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
                     # 記錄性能數據到 JSON
                     performance_log = {
                         "timestamp": datetime.now().isoformat(),
-                        "momo_product_id": str(selected_momo_row.get('id', 'N/A')),
-                        "momo_product_title": selected_momo_row['title'],
+                        "source_product_id": str(selected_product_row.get('id', 'N/A')),
+                        "source_product_title": selected_product_row['title'],
                         "stage2_duration_seconds": round(stage2_duration, 3),
                         "total_candidates_tested": len(candidates_to_verify),
                         "matched_count": matched_count
@@ -1128,13 +1199,13 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
                             if len(arr) <= 1:
                                 return arr
                             pivot = arr[len(arr) // 2]
-                            pivot_price = pivot['match'].get('pchome_price', float('inf'))
+                            pivot_price = pivot['match'].get('target_price', float('inf'))
                             if pd.isna(pivot_price):
                                 pivot_price = float('inf')
                                 
-                            left = [x for x in arr if (x['match'].get('pchome_price', float('inf')) if not pd.isna(x['match'].get('pchome_price')) else float('inf')) < pivot_price]
-                            middle = [x for x in arr if (x['match'].get('pchome_price', float('inf')) if not pd.isna(x['match'].get('pchome_price')) else float('inf')) == pivot_price]
-                            right = [x for x in arr if (x['match'].get('pchome_price', float('inf')) if not pd.isna(x['match'].get('pchome_price')) else float('inf')) > pivot_price]
+                            left = [x for x in arr if (x['match'].get('target_price', float('inf')) if not pd.isna(x['match'].get('target_price')) else float('inf')) < pivot_price]
+                            middle = [x for x in arr if (x['match'].get('target_price', float('inf')) if not pd.isna(x['match'].get('target_price')) else float('inf')) == pivot_price]
+                            right = [x for x in arr if (x['match'].get('target_price', float('inf')) if not pd.isna(x['match'].get('target_price')) else float('inf')) > pivot_price]
                             
                             return quicksort(left) + middle + quicksort(right)
                         
@@ -1169,26 +1240,26 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
                         st.markdown(f"""
                         <div class="product-card" style="{card_style} padding: 20px; display: flex; align-items: start; gap: 20px; margin-bottom: 15px;">
                             <div style="width: 120px; flex-shrink: 0; text-align: center;">
-                                <div class="badge badge-pchome" style="margin-bottom: 5px;">PChome</div>
-                                <img src="{match.get('pchome_image', '')}" 
-                                     alt="{match['pchome_title'][:30]}"
+                                <div class="badge badge-pchome" style="margin-bottom: 5px;">{target_platform}</div>
+                                <img src="{match.get('target_image', '')}" 
+                                     alt="{match['target_title'][:30]}"
                                      loading="lazy"
                                      style="width: 100%; height: auto; max-height: 120px; border-radius: 4px; object-fit: contain; display: block;" 
                                      onerror="this.onerror=null; this.src='https://via.placeholder.com/120x120?text=無法載入圖片';">
                             </div>
                             <div style="flex-grow: 1;">
                                 <div style="display: flex; justify-content: space-between; align-items: start;">
-                                    <h4 style="margin: 0; font-size: 1.1rem; color: #2d3748;">{match['pchome_title']}</h4>
+                                    <h4 style="margin: 0; font-size: 1.1rem; color: #2d3748;">{match['target_title']}</h4>
                                     <span style="font-weight: bold; color: {text_color}; white-space: nowrap; margin-left: 10px;">{icon}</span>
                                 </div>
                                 <div style="margin-top: 8px; display: flex; gap: 15px; font-size: 0.9rem; color: #4a5568;">
-                                    <span>💰 <strong>NT$ {match.get('pchome_price', 0) if match.get('pchome_price') and not pd.isna(match.get('pchome_price')) else '價格未提供'}</strong></span>
+                                    <span>💰 <strong>NT$ {match.get('target_price', 0) if match.get('target_price') and not pd.isna(match.get('target_price')) else '價格未提供'}</strong></span>
                                 </div>
                                 <div class="ai-reasoning-box">
                                     <strong>💡 判斷理由：</strong>{result.get('reasoning', '無詳細理由')}
                                 </div>
                                 <div style="margin-top: 8px; text-align: right;">
-                                    <a href="{match.get('pchome_url', '#')}" target="_blank" style="color: #3182ce; text-decoration: none; font-size: 0.85rem;">查看商品詳情 &rarr;</a>
+                                    <a href="{match.get('target_url', '#')}" target="_blank" style="color: #3182ce; text-decoration: none; font-size: 0.85rem;">查看商品詳情 &rarr;</a>
                                 </div>
                             </div>
                         </div>
@@ -1210,7 +1281,19 @@ def show_comparison_dialog(selected_momo_row, dialog_key):
 # ============= 主內容區 =============
 
 # 顯示完整商品網格
-st.markdown("## 🛍️ MOMO 購物網商品列表")
+# 根據比對方向決定顯示哪個平台的商品
+match_direction = st.session_state.get('match_direction', 'momo_to_pchome')
+
+if match_direction == 'momo_to_pchome':
+    st.markdown("## 🛍️ MOMO 購物網商品列表")
+    source_platform = "MOMO"
+    target_platform = "PChome"
+    display_df = momo_products_in_query
+else:
+    st.markdown("## 🛍️ PChome 購物網商品列表")
+    source_platform = "PChome"
+    target_platform = "MOMO"
+    display_df = pchome_candidates_pool
 
 # 根據是否有相似商品分類
 if st.session_state.similarities:
@@ -1218,17 +1301,17 @@ if st.session_state.similarities:
     products_with_matches = []
     products_without_matches = []
     
-    for idx, row in momo_products_in_query.iterrows():
-        momo_id = str(row['id'])
-        if momo_id in st.session_state.similarities and st.session_state.similarities[momo_id]:
+    for idx, row in display_df.iterrows():
+        product_id = str(row['id'])
+        if product_id in st.session_state.similarities and st.session_state.similarities[product_id]:
             products_with_matches.append((idx, row))
         else:
             products_without_matches.append((idx, row))
     
     # 顯示有相似商品的部分
     if products_with_matches:
-        st.markdown("### ✅ 有找到相似商品 ({} 件)".format(len(products_with_matches)))
-        st.markdown("這些商品在 PChome 找到了相似的商品，點擊查看詳細比價")
+        st.markdown(f"### ✅ 有找到相似商品 ({len(products_with_matches)} 件)")
+        st.markdown(f"這些商品在 {target_platform} 找到了相似的商品，點擊查看詳細比價")
         
         cols_per_row = 4
         for i in range(0, len(products_with_matches), cols_per_row):
@@ -1266,7 +1349,7 @@ if st.session_state.similarities:
                         use_container_width=True,
                         type="primary"
                     ):
-                        st.session_state.selected_momo_index = prod_idx
+                        st.session_state.selected_product_index = prod_idx
                         st.session_state.dialog_open = True
                         st.session_state.dialog_key += 1
                         st.rerun()
@@ -1359,15 +1442,21 @@ else:
                     use_container_width=True,
                     type="primary"
                 ):
-                    st.session_state.selected_momo_index = prod_idx
+                    st.session_state.selected_product_index = prod_idx
                     st.session_state.dialog_open = True
                     st.session_state.dialog_key += 1
                     st.rerun()
 
 # 檢查是否需要顯示 dialog
-if st.session_state.dialog_open and st.session_state.selected_momo_index is not None:
-    selected_momo_row = momo_products_in_query.iloc[st.session_state.selected_momo_index]
-    show_comparison_dialog(selected_momo_row, st.session_state.dialog_key)
+if st.session_state.dialog_open and st.session_state.selected_product_index is not None:
+    # 根據比對方向選擇正確的商品資料源
+    match_direction = st.session_state.get('match_direction', 'momo_to_pchome')
+    if match_direction == 'momo_to_pchome':
+        selected_product_row = momo_products_in_query.iloc[st.session_state.selected_product_index]
+    else:
+        selected_product_row = pchome_candidates_pool.iloc[st.session_state.selected_product_index]
+    
+    show_comparison_dialog(selected_product_row, st.session_state.dialog_key)
     # Dialog 關閉後清除狀態
     st.session_state.dialog_open = False
-    st.session_state.selected_momo_index = None
+    st.session_state.selected_product_index = None
