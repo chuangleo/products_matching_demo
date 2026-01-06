@@ -11,8 +11,6 @@ wheels/
 
 # 環境變數檔案 - 包含敏感資訊（API Keys）
 .env
-.env.local
-.env.*.local
 
 # Streamlit secrets
 .streamlit/secrets.toml
@@ -27,9 +25,27 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# 截圖
-*_screenshot.png
-*_error_screenshot.png
-
-# 模型檔案（太大，雲端部署時從 Hugging Face 下載）
+# 模型檔案（通常很大）
 models/
+
+# 爬蟲產生的數據檔案
+*.csv
+momo.csv
+pchome.csv
+
+# 執行時產生的日誌和數據
+*.json
+!pyproject.json
+active_users.json
+search_logs.json
+stage2_performance*.json
+stage2_timing_logs.json
+user_peak.json
+
+# Cloudflare 隧道設定（可能包含敏感路徑）
+cloudflared-config.yml
+
+# ChromeDriver 和 Selenium 相關
+chromedriver.exe
+chromedriver
+.wdm/
